@@ -631,20 +631,14 @@ def train_meta_learner(archs, num_classes, batch_size,
 num_classes = 10
 epochs = 100
 # batch_size = 512
-sub_folder = 'M18'
+sub_folder = 'M19'
 archs = ['rnn','cnn']  #, 'lstm', 'gru', 'cnn']
 wl = 10
 dropout = 0.1
 num_heads = 2
-seeds = [42, 672, 10752]
-        #,4,19,6,12,23,20,8,9,18,37,38,82,83,46,33,49,410,1000]#
-        # [6, 28, 42, 95, 138, 196, 276, 496, 8128]
-        #, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144,
-        # 233, 377, 610, 987, 1597, 2584 , 4181, 6765,
-        # 10946, 17711, 28657, 46368, 75025, 121393,
-        # 196418, 317811, 514229]
-# dim = 128
-optimizers = ['adamw','rmsprop']  #,'adam','nadam','adamax']
+seeds = [42]
+
+optimizers = ['adamw',]  #'rmsprop']  #,'adam','nadam','adamax']
 
 dataset = 'Take5' #,'Quick','Mega','Thunderball','Euro','Powerball','C4L','NYLot','HotPicks']
 # for dataset in datasets:
@@ -670,9 +664,12 @@ for _ in range(10):
     data_scaler = joblib.load(f'test_models/{sub_folder}/{dataset}_base_scaler.joblib')
     X_full = data_scaler.transform(data)
 
-    extra_features = get_extra_features(X_full, [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, #])
-                                                 233, 377, 610, 987, 1597, 2584 , 4181, 6765, #])
-                                                 6, 28, 42, 95, 138, 196, 276, 496, 8128])
+    extra_features = get_extra_features(X_full, [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987,
+                                                 1597, 2584, 4181, 6765, 10946, 17711, 28657, 46368, 75025, 121393,
+                                                 196418, 317811, 514229, 832040, 1346269, 2178309, 3524578, 5702887,
+                                                 9227465, 14930352, 24157817, 39088169, 63245986, 102334155, 165580141,
+                                                 267914296, 433494437, 701408733, 1134903170, 1836311903, 2971215073
+                                                ])
     feature_scaler = joblib.load(f'test_models/{sub_folder}/{dataset}_feature_scaler.joblib')
     scaled_features = feature_scaler.transform(extra_features)
     X_full = np.hstack([X_full, scaled_features], dtype=np.float32)
