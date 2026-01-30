@@ -5,16 +5,17 @@ shutup.please()
 import gc
 import math
 import random
-import scipy
 import joblib
 import numpy as np
 import pandas as pd
+from scipy.stats import skew
 import tensorflow as tf
 from tensorflow.keras import layers, models, callbacks, saving
+from sklearn.pipeline import Pipeline
 from sklearn.metrics import accuracy_score
-from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
+from sklearn.preprocessing import MinMaxScaler, QuantileTransformer, PowerTransformer
 from hmmlearn.hmm import GaussianHMM, CategoricalHMM, GMMHMM, PoissonHMM, MultinomialHMM
 
 seed=42
@@ -27,6 +28,38 @@ random.seed(seed)
 gpus = tf.config.list_physical_devices('GPU')
 for gpu in gpus:
     tf.config.experimental.set_memory_growth(gpu, True)
+
+
+def compute_window_stats(data, wl):
+    # X_windows: shape (num_samples, window_size)
+    features = np.empty([len(data) - wl, 4], dtype=np.float32)
+    features = []
+    for i in range(len(data) - wl):
+        window = data[i:i+wl]
+        mean = np.mean(window)
+        std = np.std(window)
+        skewness = skew(window)
+        kurt = kurtosis(window)
+        stats = np.hstack([mean, std, skewness, kurt])
+        features[i] = stats
+    return features    
+
+
+def transform_selector(data, sub_folder, dataset):
+    s = skew(data.flatten())
+    
+    if s > 0.5:
+        tf = PowerTransformer(method='yeo-johnson')
+    elif s < -0.5:
+        tf = PowerTransformer(method='yeo-johnson')
+    else:
+        tf = MinMaxScaler()
+    
+    tf_data = tf.fit_transform(data)
+    joblib.dump(tf, f'test_models/{sub_folder}/{dataset}_base_scaler.joblib')
+    
+    return tf_data.astype(np.float32), tf
+    
 
 # --- Get real world data ---
 def get_real_data(dataset, num_samples=200_000):
@@ -51,14 +84,24 @@ def get_real_data(dataset, num_samples=200_000):
     return full_data[-num_samples:]
 
 
-# --- Generate data sequences ---
-def generate_dataset(data, wl=10, features=1):
+# --- Generate 3D data sequences ---
+def generate_dataset(X, data, wl=10, features=1):
     X_test = np.empty([len(data)-wl, wl, features], dtype=np.float32)
     y_test = np.empty([len(data)-wl, 1], dtype=np.int8)
     for i in range(len(data)-wl):
-        X_test[i] = data[i:i+wl]
+        X_test[i] = X[i:i+wl]
         y_test[i] = data[i+wl, :1]    
-    return X_test, y_test    
+    return X_test, y_test
+
+
+# --- Generate 2D data sequences ---
+def create_windows(data, wl=10):
+    X_test = np.empty([len(data)-wl, wl], dtype=np.int8)
+    y_test = np.empty([len(data)-wl, 1], dtype=np.int8)
+    for i in range(len(data) - wl):
+        X_test[i] = data[i:i + wl]
+        y_test[i] = data[i + wl]
+    return X_test, y_test
 
 
 @tf.keras.saving.register_keras_serializable()
@@ -138,20 +181,20 @@ def hmm_normal_stack(X_raw, rngs):
             hs4 = hs4_pred  # Update for potential further iterations
             # print(f'\nhs4:\n{hs4}')
 
-        for _ in range(1):
-            # MultinomialHMM Feature
-            # print('\nNow running MultinomialHMM normal...')
-            hmm_multi = MultinomialHMM(n_components=e, random_state=rng)
-            hmm_multi.fit(hs5)
-            hs5_pred = hmm_multi.predict(hs5).reshape(-1, 1).astype(np.int8)
-            # print(hs5_pred)
-            e = len(np.unique(hs5_pred))
-            # print(f'\ne: {e}')
-            base_features = (np.hstack([base_features, hs5_pred], dtype=np.int8)
-                             if base_features is not None
-                             else hs5_pred)
-            hs5 = hs5_pred  # Update for potential further iterations
-            # print(f'\nhs5:\n{hs5}')
+        # for _ in range(1):
+        #     # MultinomialHMM Feature
+        #     # print('\nNow running MultinomialHMM normal...')
+        #     hmm_multi = MultinomialHMM(n_components=e, random_state=rng)
+        #     hmm_multi.fit(hs5)
+        #     hs5_pred = hmm_multi.predict(hs5).reshape(-1, 1).astype(np.int8)
+        #     # print(hs5_pred)
+        #     e = len(np.unique(hs5_pred))
+        #     # print(f'\ne: {e}')
+        #     base_features = (np.hstack([base_features, hs5_pred], dtype=np.int8)
+        #                      if base_features is not None
+        #                      else hs5_pred)
+        #     hs5 = hs5_pred  # Update for potential further iterations
+        #     # print(f'\nhs5:\n{hs5}')
     return base_features
 
 
@@ -586,18 +629,20 @@ def train_meta_learner(archs, num_classes, batch_size,
 num_classes = 10
 epochs = 10
 # batch_size = 512
-sub_folder = 'M14'
-archs = ['cnn','rnn']  #, 'lstm', 'gru', 'cnn']
+sub_folder = 'M15'
+archs = ['rnn','cnn']  #, 'lstm', 'gru', 'cnn']
 wl = 10
-dropout = 0.5
+dropout = 0.1
 num_heads = 2
-seeds = [11,5,16,13,25,3,15,1,14]  #,4,19,6,12,23,20,8,9,18,37,38,82,83,46,33,49,410,1000]# [6, 28, 42, 95, 138, 196, 276, 496, 8128]  #, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144,
-         # 233, 377, 610, 987, 1597, 2584 , 4181, 6765,
-         # 10946, 17711, 28657, 46368, 75025, 121393,
-         # 196418, 317811, 514229]
+seeds = [11,5,16,13,25,3,15,1,14]
+        #,4,19,6,12,23,20,8,9,18,37,38,82,83,46,33,49,410,1000]#
+        # [6, 28, 42, 95, 138, 196, 276, 496, 8128]
+        #, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144,
+        # 233, 377, 610, 987, 1597, 2584 , 4181, 6765,
+        # 10946, 17711, 28657, 46368, 75025, 121393,
+        # 196418, 317811, 514229]
 # dim = 128
-optimizers = ['adamw','rmsprop']  #'adam','nadam','adamax']
-# stats = [np.mean, np.std, np.ptp, scipy.stats.skew, scipy.stats.kurtosis]
+optimizers = ['adamw','rmsprop','adam','nadam','adamax']
 
 dataset = 'Take5' #,'Quick','Mega','Thunderball','Euro','Powerball','C4L','NYLot','HotPicks']
 # for dataset in datasets:
@@ -608,15 +653,18 @@ class_weights = compute_class_weight('balanced', classes=unique_classes, y=X_raw
 class_weights_dict = dict(enumerate(class_weights))
 
 data_raw = X_raw.reshape(-1,1)
-data_raw = np.vstack([data_raw[1:], [0]], dtype=np.int8)
+data_raw = np.vstack([data_raw, [0]], dtype=np.int8)
 
 # print(f'\nOriginal data_raw tail: {data_raw[-10:].flatten()}\n')
 
 fin_res = []
-for _ in range(1):
+for _ in range(3):
     # extra_features = get_extra_features(data_raw, seeds)
     # data = np.hstack([data_raw, extra_features], dtype=np.int8)
     data = data_raw
+    
+    # Data Transformations
+    X, data_scaler = transform_selector(data, sub_folder, dataset)    
     
     # del X_raw, data_raw, extra_features
     # data = data_raw
@@ -627,31 +675,41 @@ for _ in range(1):
     input_shape = (wl, features)
     print(f'\ninput_shape: {input_shape}\n')    
     
-    dim = features*4
+    dim = 128  #features
 
-    X, y = generate_dataset(data, wl, features)
+    X, y = generate_dataset(X, data, wl, features)
+    # X, y = create_windows(data, wl)
+
+    # # Data Transformations
+    # X = transform_selector(X, sub_folder, dataset)
+
+    # Reshape X & y to 3D as per model expectation
+    # X = X.reshape(-1, wl, features)
+    # y = y.reshape(-1, 1)
+
+    # Data splitting
     X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.2, shuffle=False)
     X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, shuffle=False)
     # del X, y, X_temp, y_temp
     
     # Scaling data
-    scaler = MinMaxScaler()
-    X_train_2d = X_train.reshape(-1, X_train.shape[1]*X_train.shape[2])
-    X_val_2d = X_val.reshape(-1, X_val.shape[1]*X_val.shape[2])
-    X_test_2d = X_test.reshape(-1, X_test.shape[1]*X_test.shape[2])
+    # scaler = MinMaxScaler()
+    # X_train_2d = X_train.reshape(-1, X_train.shape[1]*X_train.shape[2])
+    # X_val_2d = X_val.reshape(-1, X_val.shape[1]*X_val.shape[2])
+    # X_test_2d = X_test.reshape(-1, X_test.shape[1]*X_test.shape[2])
     
-    X_train_scaled = scaler.fit_transform(X_train_2d)
-    X_val_scaled = scaler.transform(X_val_2d)
-    X_test_scaled = scaler.transform(X_test_2d)
+    # X_train_scaled = scaler.fit_transform(X_train_2d)
+    # X_val_scaled = scaler.transform(X_val_2d)
+    # X_test_scaled = scaler.transform(X_test_2d)
     
-    joblib.dump(scaler, f'test_models/{sub_folder}/{dataset}_base_scaler.joblib')
+    # joblib.dump(scaler, f'test_models/{sub_folder}/{dataset}_base_scaler.joblib')
     
     # del X_train_2d, X_val_2d, X_test_2d, scaler
     
     # Reshape back to 3D format
-    X_train = X_train_scaled.reshape(-1, X_train.shape[1], X_train.shape[2])
-    X_val = X_val_scaled.reshape(-1, X_val.shape[1], X_val.shape[2])
-    X_test = X_test_scaled.reshape(-1, X_test.shape[1], X_test.shape[2])
+    # X_train = X_train_scaled.reshape(-1, X_train.shape[1], X_train.shape[2])
+    # X_val = X_val_scaled.reshape(-1, X_val.shape[1], X_val.shape[2])
+    # X_test = X_test_scaled.reshape(-1, X_test.shape[1], X_test.shape[2])
     
     # del X_train_scaled, X_val_scaled, X_test_scaled
     
@@ -750,10 +808,10 @@ for _ in range(1):
     # print(f'\nLoaded Scaler: {dataset}_base_scaler in {sub_folder}')
 
     # Reshape data according saved scaler requirements
-    pred_data = data[-10:].reshape(-1, wl*features)
+    pred_data = data[-10:]  #.reshape(-1, wl*features)
 
     # Scale data
-    pred_data_scaled = scaler.transform(pred_data)
+    pred_data_scaled = data_scaler.transform(pred_data)
     
     # Reshape to 3D format as per model expectation
     pred_data_reshaped = pred_data_scaled.reshape(-1, wl, features)
@@ -775,7 +833,7 @@ for _ in range(1):
     new_pred = np.argmax(meta1.predict(p_train, verbose=0), axis=1)
     fin_res.extend(new_pred)
         
-    data_raw = np.vstack([data_raw[1:], new_pred], dtype=np.int8)
+    data_raw = np.vstack([data_raw, new_pred], dtype=np.int8)
     print(f'\nLast 10 entries of updated_data_raw: {data_raw[-10:].flatten()}')
     print(f'\n\n\t\tResults so far: {fin_res}\n\n')
     
