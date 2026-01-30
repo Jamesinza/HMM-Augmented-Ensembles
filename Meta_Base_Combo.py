@@ -8,6 +8,7 @@ import random
 import joblib
 import numpy as np
 import pandas as pd
+from numba import njit
 from scipy.stats import skew
 import tensorflow as tf
 from tensorflow.keras import layers, models, callbacks, saving
@@ -15,19 +16,96 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
-from sklearn.preprocessing import MinMaxScaler, QuantileTransformer, PowerTransformer
+from sklearn.preprocessing import StandardScaler, QuantileTransformer, PowerTransformer
 from hmmlearn.hmm import GaussianHMM, CategoricalHMM, GMMHMM, PoissonHMM, MultinomialHMM
+from hmmlearn.vhmm import VariationalGaussianHMM
 
 seed=42
 np.random.seed(seed)
 tf.random.set_seed(seed)
 random.seed(seed)
 
-# tf.keras.mixed_precision.set_global_policy('mixed_float16')
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
+# tf.keras.config.enable_unsafe_deserialization()
 
 gpus = tf.config.list_physical_devices('GPU')
 for gpu in gpus:
     tf.config.experimental.set_memory_growth(gpu, True)
+
+
+# === TSMixer BLOCK ===
+@tf.keras.saving.register_keras_serializable()
+class TSMixerBlock(tf.keras.layers.Layer):
+    def __init__(self, time_steps=10, num_features=1, hidden_dim=64, dropout_rate=0.1, seed=42, **kwargs):
+        super().__init__(**kwargs)
+        self.hidden_dim = hidden_dim
+        self.dropout_rate = dropout_rate
+        self.seed = seed
+        self.time_steps = time_steps
+        self.num_features = num_features
+
+    def build(self, input_shape):
+        self.time_dense1 = layers.Dense(
+            self.hidden_dim, activation='gelu', kernel_initializer=tf.keras.initializers.HeNormal(seed=self.seed))
+        self.time_dropout = layers.Dropout(self.dropout_rate, seed=self.seed)
+        self.time_dense2 = layers.Dense(self.time_steps,
+                                        kernel_initializer=tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02, seed=seed))
+        self.time_norm = layers.LayerNormalization()
+
+        self.feature_dense1 = layers.Dense(
+            self.hidden_dim, activation='gelu', kernel_initializer=tf.keras.initializers.HeNormal(seed=self.seed))
+        self.feature_dropout = layers.Dropout(self.dropout_rate, seed=self.seed)
+        self.feature_dense2 = layers.Dense(self.num_features,
+                                           kernel_initializer=tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02, seed=seed))
+        self.feature_norm = layers.LayerNormalization()
+
+        super().build(input_shape)
+
+    def call(self, x):
+        # Time-mixing
+        residual = x
+        x_t = tf.transpose(x, perm=[0, 2, 1])
+        x_t = self.time_dense1(x_t)
+        x_t = self.time_dropout(x_t)
+        x_t = self.time_dense2(x_t)
+        x = tf.transpose(x_t, perm=[0, 2, 1])
+        x = self.time_norm(x + residual)
+
+        # Feature-mixing
+        residual = x
+        x_f = self.feature_dense1(x)
+        x_f = self.feature_dropout(x_f)
+        x_f = self.feature_dense2(x_f)
+        x = self.feature_norm(x + residual)
+        return x
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "hidden_dim": self.hidden_dim,
+            "dropout_rate": self.dropout_rate,
+            "seed": self.seed,
+            "time_steps": self.time_steps,
+            "num_features": self.num_features
+        })
+        return config
+ 
+
+def select_best_n_components(X, component_range):
+    best_score = -np.inf
+    best_n_components = None
+    for n in range(component_range):
+        model = GaussianHMM(n_components=n, covariance_type='full', n_iter=100)
+        try:
+            model.fit(X)
+            score = model.score(X)
+            if score > best_score:
+                best_score = score
+                best_n_components = n
+                print(f"\nBest so far n_components = {best_n_components}")
+        except:
+            continue
+    return best_n_components    
 
 
 def compute_window_stats(data, wl):
@@ -53,7 +131,7 @@ def transform_selector(data, sub_folder, dataset):
     elif s < -0.5:
         tf = PowerTransformer(method='yeo-johnson')
     else:
-        tf = MinMaxScaler()
+        tf = StandardScaler()
     
     tf_data = tf.fit_transform(data)
     joblib.dump(tf, f'test_models/{sub_folder}/{dataset}_base_scaler.joblib')
@@ -90,7 +168,7 @@ def generate_dataset(X, data, wl=10, features=1):
     y_test = np.empty([len(data)-wl, 1], dtype=np.int8)
     for i in range(len(data)-wl):
         X_test[i] = X[i:i+wl]
-        y_test[i] = data[i+wl, :1]    
+        y_test[i] = data[i+wl]    
     return X_test, y_test
 
 
@@ -114,7 +192,7 @@ class ForgetBiasInitializer(tf.keras.initializers.Initializer):
         return result
 
 
-def hmm_normal_stack(X_raw, rngs):
+def hmm_normal_stack(X_raw, rngs, n=5):
     """
     Augment the raw input with HMM-based features.
     The raw data X_raw is assumed to be a 2D array.
@@ -131,66 +209,66 @@ def hmm_normal_stack(X_raw, rngs):
 
         # --- HMM Feature Augmentation ---
         # Loop over a single iteration or more if needed.
-        a=b=c=d=e=10
+        a=b=c=d=e=n
         for _ in range(1):
             # GaussianHMM and CategoricalHMM
             # print('\nNow running GaussianHMM normal...')
-            hmm_g = GaussianHMM(n_components=a, covariance_type="full", random_state=rng)
+            hmm_g = GaussianHMM(n_components=8, covariance_type="full", random_state=rng)
             # print('\nNow running CategoricalHMM normal...')
-            hmm_c = CategoricalHMM(n_components=b, n_features=10, random_state=rng)
+            # hmm_c = CategoricalHMM(n_components=b, n_features=10, random_state=rng)
             hmm_g.fit(hs1)
-            hmm_c.fit(hs2)
-            hs1_pred = hmm_g.predict(hs1).reshape(-1, 1).astype(np.int8)
+            # hmm_c.fit(hs2)
+            hs1_pred = hmm_g.predict(hs1).reshape(-1, 1).astype(np.float32)
             a = len(np.unique(hs1_pred))
             # print(f'\na: {a}')
-            hs2_pred = hmm_c.predict(hs2).reshape(-1, 1).astype(np.int8)
-            b = len(np.unique(hs2_pred))
+            # hs2_pred = hmm_c.predict(hs2).reshape(-1, 1).astype(np.int8)
+            # b = len(np.unique(hs2_pred))
             # print(f'\nb: {b}')
-            base_features = (np.hstack([base_features, hs1_pred, hs2_pred], dtype=np.int8)
+            base_features = (np.hstack([base_features, hs1_pred], dtype=np.float32)
                              if base_features is not None
-                             else np.hstack([hs1_pred, hs2_pred], dtype=np.int8))
-            hs1, hs2 = hs1_pred, hs2_pred  # Update for potential further iterations
+                             else np.hstack([hs1_pred], dtype=np.float32))
+            hs1 = hs1_pred  # Update for potential further iterations
             # print(f'\nhs1:\n{hs1}')
             # print(f'hs2:\n{hs2}\n')
 
-        for i in range(1):
-            # GMMHMM Feature
-            # print('\nNow running GMMHMM stepped...')
-            hmm_gmm = GMMHMM(n_components=c, n_mix=1, covariance_type="full", random_state=rng)
-            hmm_gmm.fit(hs3)
-            hs3_pred = hmm_gmm.predict(hs3).reshape(-1, 1).astype(np.int8)
-            c = len(np.unique(hs3_pred))
-            # print(f'\nc: {c}')
-            base_features = (np.hstack([base_features, hs3_pred], dtype=np.int8)
-                             if base_features is not None
-                             else hs3_pred)
-            hs3 = hs3_pred  # Update for potential further iterations
-            # print(f'\nhs3:\n{hs3}')
+        # for i in range(1):
+        #     # GMMHMM Feature
+        #     # print('\nNow running GMMHMM stepped...')
+        #     hmm_gmm = GMMHMM(n_components=5, n_mix=1, covariance_type="full", random_state=rng)
+        #     hmm_gmm.fit(hs3)
+        #     hs3_pred = hmm_gmm.predict(hs3).reshape(-1, 1).astype(np.float32)
+        #     c = len(np.unique(hs3_pred))
+        #     # print(f'\nc: {c}')
+        #     base_features = (np.hstack([base_features, hs3_pred], dtype=np.float32)
+        #                      if base_features is not None
+        #                      else hs3_pred)
+        #     hs3 = hs3_pred  # Update for potential further iterations
+        #     # print(f'\nhs3:\n{hs3}')
 
-        for _ in range(1):
-            # PoissonHMM Feature
-            # print('\nNow running PoissonHMM normal...')
-            hmm_pois = PoissonHMM(n_components=d, random_state=rng)
-            hmm_pois.fit(hs4)
-            hs4_pred = hmm_pois.predict(hs4).reshape(-1, 1).astype(np.int8)
-            d = len(np.unique(hs4_pred))
-            # print(f'\nc: {c}')
-            base_features = (np.hstack([base_features, hs4_pred], dtype=np.int8)
-                             if base_features is not None
-                             else hs4_pred)
-            hs4 = hs4_pred  # Update for potential further iterations
-            # print(f'\nhs4:\n{hs4}')
+        # for _ in range(1):
+        #     # PoissonHMM Feature
+        #     # print('\nNow running PoissonHMM normal...')
+        #     hmm_pois = PoissonHMM(n_components=d, random_state=rng)
+        #     hmm_pois.fit(hs4)
+        #     hs4_pred = hmm_pois.predict(hs4).reshape(-1, 1).astype(np.float32)
+        #     d = len(np.unique(hs4_pred))
+        #     # print(f'\nc: {c}')
+        #     base_features = (np.hstack([base_features, hs4_pred], dtype=np.float32)
+        #                      if base_features is not None
+        #                      else hs4_pred)
+        #     hs4 = hs4_pred  # Update for potential further iterations
+        #     # print(f'\nhs4:\n{hs4}')
 
         # for _ in range(1):
         #     # MultinomialHMM Feature
         #     # print('\nNow running MultinomialHMM normal...')
-        #     hmm_multi = MultinomialHMM(n_components=e, random_state=rng)
+        #     hmm_multi = VariationalGaussianHMM(n_components=9, random_state=rng)
         #     hmm_multi.fit(hs5)
-        #     hs5_pred = hmm_multi.predict(hs5).reshape(-1, 1).astype(np.int8)
+        #     hs5_pred = hmm_multi.predict(hs5).reshape(-1, 1).astype(np.float32)
         #     # print(hs5_pred)
         #     e = len(np.unique(hs5_pred))
         #     # print(f'\ne: {e}')
-        #     base_features = (np.hstack([base_features, hs5_pred], dtype=np.int8)
+        #     base_features = (np.hstack([base_features, hs5_pred], dtype=np.float32)
         #                      if base_features is not None
         #                      else hs5_pred)
         #     hs5 = hs5_pred  # Update for potential further iterations
@@ -215,25 +293,25 @@ def hmm_stepped_stack(X_raw, rngs):
 
         # --- HMM Feature Augmentation ---
         # Loop over a single iteration or more if needed.
-        a=b=9
+        a=b=2
         for i in range(1):
             # GaussianHMM and CategoricalHMM
             # print('\nNow running GaussianHMM stepped...')
             hmm_g = GaussianHMM(n_components=a - i, covariance_type="full", random_state=rng)
             # print('\nNow running CategoricalHMM stepped...')
-            hmm_c = CategoricalHMM(n_components=b - i, n_features=10, random_state=rng)
+            # hmm_c = CategoricalHMM(n_components=b - i, n_features=10, random_state=rng)
             hmm_g.fit(hs1)
-            hmm_c.fit(hs2)
-            hs1_pred = hmm_g.predict(hs1).reshape(-1, 1).astype(np.int8)
+            # hmm_c.fit(hs2)
+            hs1_pred = hmm_g.predict(hs1).reshape(-1, 1).astype(np.float32)
             a = len(np.unique(hs1_pred))
             # print(f'\na: {a}')
-            hs2_pred = hmm_c.predict(hs2).reshape(-1, 1).astype(np.int8)
-            b = len(np.unique(hs2_pred))
+            # hs2_pred = hmm_c.predict(hs2).reshape(-1, 1).astype(np.int8)
+            # b = len(np.unique(hs2_pred))
             # print(f'\nb: {b}')
-            base_features = (np.hstack([base_features, hs1_pred, hs2_pred], dtype=np.int8)
+            base_features = (np.hstack([base_features, hs1_pred], dtype=np.float32)
                              if base_features is not None
-                             else np.hstack([hs1_pred, hs2_pred], dtype=np.int8))
-            hs1, hs2 = hs1_pred, hs2_pred  # Update for potential further iterations
+                             else np.hstack([hs1_pred], dtype=np.float32))
+            hs1 = hs1_pred  # Update for potential further iterations
             # print(f'\nhs1:\n{hs1}')
             # print(f'hs2:\n{hs2}\n')
     return base_features
@@ -243,20 +321,16 @@ def get_extra_features(X_raw, rng):
     """
     Create HMM-based and NVG-based features.
     """
-    hmm_features1 = hmm_normal_stack(X_raw, rng)
-    # print(f'\nhmm_features1: {hmm_features1.shape}')
-    hmm_features2 = hmm_stepped_stack(X_raw, rng)
-    # print(f'hmm_features2: {hmm_features2.shape}')
+    data = hmm_normal_stack(X_raw, rng)
+    scaler = StandardScaler()
+    scaled_data = scaler.fit_transform(data)
+    joblib.dump(scaler, f'test_models/{sub_folder}/{dataset}_feature_scaler.joblib')
+    return scaled_data
 
-    # Stack all new features.
-    X_augmented = np.hstack([hmm_features1, hmm_features2], dtype=np.int8)
-    # X_augmented = hmm_features1
-    return X_augmented
-
-    
+   
 def compute_batch_size(dataset_length):
     base_unit  = 25000
-    base_batch = 32
+    base_batch = 16
     batch_size = base_batch * math.ceil(dataset_length / base_unit)
     return batch_size    
 
@@ -330,10 +404,25 @@ def lstm_net(inputs, dim, dropout, seeds):
     return x1, x2, x3
 
 
+# --- TSMixer Model ---
+def create_tsmixer_base_model(dataset, arch, optimizer, dim, seed, dropout, num_classes, s):
+    initializer1 = tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02, seed=seed)
+    inputs = layers.Input(shape=input_shape)
+    x = inputs
+    x = layers.Dense(dim, activation='gelu', kernel_initializer=initializer1)(inputs)
+    for i in range(2):
+        x = TSMixerBlock(wl, features, dim, dropout, seed)(x)
+    x = layers.GlobalAveragePooling1D()(x)
+    out = layers.Dense(num_classes, activation='softmax', kernel_initializer=initializer1)(x)
+    model = models.Model(inputs, out, name=f'{dataset}_{arch}_{optimizer}_dim{dim}_seed{seed}_s{s}')
+    model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['sparse_categorical_accuracy'], jit_compile=True)
+    return model
+
+
 # --- Base Model Generator ---
-def create_cnn_base_model(dataset, arch, optimizer, dim, seed, dropout, num_classes):
-    initializer1 = tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02, seed=11)
-    initializer2 = tf.keras.initializers.HeUniform(seed=5)    
+def create_cnn_base_model(dataset, arch, optimizer, dim, seed, dropout, num_classes, s):
+    initializer1 = tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02, seed=seed)
+    initializer2 = tf.keras.initializers.HeUniform(seed=seed)    
     inputs = tf.keras.layers.Input(input_shape)
 
     out = cnn_net(inputs, dim, dropout, seed)
@@ -342,7 +431,7 @@ def create_cnn_base_model(dataset, arch, optimizer, dim, seed, dropout, num_clas
     # out = tf.keras.layers.Dense(dim*2, activation='relu', kernel_initializer=initializer2)(out)
     out = layers.Dense(num_classes, activation='softmax', kernel_initializer=initializer1)(out)
 
-    model = tf.keras.models.Model(inputs=inputs, outputs=out, name=f'{dataset}_{arch}_{optimizer}_{dim}_{seed}')
+    model = tf.keras.models.Model(inputs=inputs, outputs=out, name=f'{dataset}_{arch}_{optimizer}_dim{dim}_seed{seed}_s{s}')
     model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['sparse_categorical_accuracy'], jit_compile=True)
     return model    
 
@@ -410,7 +499,7 @@ def create_lstm_base_model(dataset, arch, optimizer, dim, seeds, dropout=0.6, nu
     return model
 
 
-def create_rnn_base_model(dataset, arch, optimizer, dim, seed, dropout, num_classes):
+def create_rnn_base_model(dataset, arch, optimizer, dim, seed, dropout, num_classes, s):
     initializer1 = tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02, seed=seed)
     initializer2 = tf.keras.initializers.HeUniform(seed=seed)
     glorot=tf.keras.initializers.GlorotUniform(seed=seed)
@@ -438,29 +527,34 @@ def create_rnn_base_model(dataset, arch, optimizer, dim, seed, dropout, num_clas
     out = tf.keras.layers.Dense(dim, activation='relu', kernel_initializer=initializer2)(out)
     out = layers.Dense(num_classes, activation='softmax', kernel_initializer=initializer1)(out)
 
-    model = models.Model(inputs, out, name=f'{dataset}_{arch}_{optimizer}_{dim}_{seed}')
+    model = models.Model(inputs, out, name=f'{dataset}_{arch}_{optimizer}_dim{dim}_seed{seed}_s{s}')
     model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['sparse_categorical_accuracy'])
     return model    
 
 
 # --- Train Base Models ---
 def train_base_models(dataset, archs, optimizers, dim, seeds, dropout, num_classes, batch_size,
-                      epochs, sub_folder, X_train, X_val, y_train, y_val):
+                      epochs, sub_folder, X_train, X_val, y_train, y_val, s):
     for arch in archs:
         for optimizer in optimizers:
-            if arch=='rnn' or arch=='cnn':
+            if arch=='rnn' or arch=='cnn' or arch=='tsmixer':
                 for seed in seeds:
                     tf.keras.backend.clear_session()
                     callback = [
                         callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1),
                         callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.9, patience=3)
-                    ]                    
-                    model = create_rnn_base_model(dataset, arch, optimizer, dim, seed, dropout, num_classes)
-                    # model.summary()
-                    print(f'\nTraining {dataset}_{arch}_{optimizer}_dim{dim}_seed{seed}...')
+                    ]
+                    if arch=='rnn':
+                        model = create_rnn_base_model(dataset, arch, optimizer, dim, seed, dropout, num_classes, s)
+                    elif arch=='cnn':
+                        model = create_cnn_base_model(dataset, arch, optimizer, dim, seed, dropout, num_classes, s)
+                    else:
+                        model = create_tsmixer_base_model(dataset, arch, optimizer, dim, seed, dropout, num_classes, s)
+                    model.summary()
+                    print(f'\nTraining {dataset}_{arch}_{optimizer}_dim{dim}_seed{seed}_s{s}...')
                     model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, validation_data=(X_val, y_val),
                               verbose=1, callbacks=callback, class_weight=class_weights_dict)
-                    model.save(f'test_models/{sub_folder}/{dataset}_{arch}_{optimizer}_dim{dim}_seed{seed}.keras')
+                    model.save(f'test_models/{sub_folder}/{dataset}_{arch}_{optimizer}_dim{dim}_seed{seed}_s{s}.keras')
                     del model                
             else:
                 tf.keras.backend.clear_session()
@@ -480,25 +574,27 @@ def train_base_models(dataset, archs, optimizers, dim, seeds, dropout, num_class
                 
                 # model.summary()
                 seed = 42
-                print(f'\nTraining {dataset}_{arch}_{optimizer}_dim{dim}_seed{seed}...')
+                print(f'\nTraining {dataset}_{arch}_{optimizer}_dim{dim}_seed{seed}_s{s}...')
                 model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, validation_data=(X_val, y_val),
                           verbose=1, callbacks=callback, class_weight=class_weights_dict)
-                model.save(f'test_models/{sub_folder}/{dataset}_{arch}_{optimizer}_dim{dim}_seed{seed}.keras')
+                model.save(f'test_models/{sub_folder}/{dataset}_{arch}_{optimizer}_dim{dim}_seed{seed}_s{s}.keras')
                 del model
 
 
-def load_base_models(sub_folder, dataset, archs, optimizers, dim, seeds, l=0):
+def load_base_models(sub_folder, dataset, archs, optimizers, dim, seeds, l=0, t_dim=128):
     # models = []
     # for dataset in datasets:
-    for arch in archs:
-        for optimizer in optimizers:
-            for seed in seeds:
+    for s in range(div):
+        for arch in archs:
+            for optimizer in optimizers:
                 if l==0:
-                    model = saving.load_model(f'test_models/{sub_folder}/{dataset}_{arch}_{optimizer}_dim{dim}_seed{seed}.keras')                        
+                    for seed in seeds:
+                        model = saving.load_model(f'test_models/{sub_folder}/{dataset}_{arch}_{optimizer}_dim{dim}_seed{seed}_s{s}.keras')
+                        yield model
                 else:
-                    model = saving.load_model(f'test_models/{sub_folder}/{dataset}{l}_{optimizer}_dim{dim}_seed{seed}.keras')
-                # models.append(model)
-                yield model            
+                    for seed in [42]:
+                        model = saving.load_model(f'test_models/{sub_folder}/{dataset}{l}_{optimizer}_dim{t_dim}_seed{seed}.keras')
+                        yield model
 
 
 # --- Evaluation ---
@@ -517,9 +613,8 @@ def create_meta_learner(num_models, num_classes, dim, optimizer, seed, dropout, 
     initializer1 = tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02, seed=seed)
     initializer2 = tf.keras.initializers.HeNormal(seed=seed)
     inputs = layers.Input(shape=(num_models, num_classes))
-    dim = 64
     num_heads = 4
-    x = layers.Dense(dim, activation="relu", kernel_initializer=initializer2)(inputs)
+    x = layers.Dense(dim, activation="gelu", kernel_initializer=initializer2)(inputs)
     x = layers.LayerNormalization()(x)
 
     for _ in range(2):
@@ -528,7 +623,7 @@ def create_meta_learner(num_models, num_classes, dim, optimizer, seed, dropout, 
         mha = layers.Dropout(dropout, seed=seed)(mha)
         x = layers.LayerNormalization()(x + mha)
         # FFN
-        ffn = layers.Dense(dim*4, activation='relu', kernel_initializer=initializer2)(x)
+        ffn = layers.Dense(dim*4, activation='gelu', kernel_initializer=initializer2)(x)
         ffn = layers.Dropout(dropout, seed=seed)(ffn)
         ffn = layers.Dense(dim, kernel_initializer=initializer1)(ffn)
         ffn = layers.Dropout(dropout, seed=seed)(ffn)
@@ -545,7 +640,7 @@ def create_meta_learner(num_models, num_classes, dim, optimizer, seed, dropout, 
 # --- Train Meta Models ---
 def train_meta_learner(archs, num_classes, batch_size,
                       epochs, dataset, sub_folder, optimizers, dim, seeds, dropout,
-                       X_train, X_val, X_test, y_train, y_val, base='base', l=0, tot_datasets=0):
+                       X_train, X_val, X_test, y_train, y_val, base='base', l=0, tot_datasets=0, t_dim=64):
         
     p_train = []
     p_val = []
@@ -557,16 +652,16 @@ def train_meta_learner(archs, num_classes, batch_size,
         # dataset = ['Meta_L'] if len(datasets)==1 else dataset
         # seeds = [42] if dataset=='Meta_L' else seeds
         print(f'\nGetting probabilities from all models in {sub_folder}...')
-        base_models = load_base_models(sub_folder, dataset, archs, optimizers, dim, seeds, l)  # Get models using generator
+        # tf.keras.config.enable_unsafe_deserialization()
+        base_models = load_base_models(sub_folder, dataset, archs, optimizers, dim, seeds, l, t_dim)  # Get models using generator
 
         for bm in base_models:
-            print(f'\nGetting probabilities from {bm.name} in {sub_folder}...')
             p_train.append(bm.predict(X_train, verbose=0))
             p_val.append(bm.predict(X_val, verbose=0))
             p_test.append(bm.predict(X_test, verbose=0))
             
             loss, acc = bm.evaluate(X_test, y_test, verbose=0)
-            print(f'\nModel {bm.name} performance\t| Loss: {loss:.4f}\t| Accuracy: {acc*100:.2f}%')
+            print(f'\nGetting probabilities from {bm.name} in {sub_folder} to train Meta Learner...\t| Loss: {loss:.4f}\t| Accuracy: {acc*100:.2f}%')
             
         p_train = np.stack(p_train, axis=1)  # shape: (batch, num_models, num_classes)
         p_val = np.stack(p_val, axis=1)
@@ -602,15 +697,15 @@ def train_meta_learner(archs, num_classes, batch_size,
                     callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1),
                     callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.9, patience=3)
                 ]
-                model = create_meta_learner(num_models, num_classes, dim, optimizer, seed, dropout, l)
+                model = create_meta_learner(num_models, num_classes, t_dim, optimizer, seed, dropout, l)
                 model.summary()
-                print(f'\nTraining Meta_L{l}_{optimizer}_dim{dim}_seed{seed}...')
+                print(f'\nTraining Meta_L{l}_{optimizer}_dim{t_dim}_seed{seed}...')
                 model.fit(
                     p_train, y_train, epochs=100, batch_size=batch_size, validation_data=(p_val, y_val),
                           verbose=1, callbacks=callback, class_weight=class_weights_dict
                 )
                 model.save(
-                    f'test_models/{sub_folder}/Meta_L{l}_{optimizer}_dim{dim}_seed{seed}.keras'
+                    f'test_models/{sub_folder}/Meta_L{l}_{optimizer}_dim{t_dim}_seed{seed}.keras'
                 )                
                 mp_train.append(model.predict(p_train, verbose=0))
                 mp_val.append(model.predict(p_val, verbose=0))
@@ -624,217 +719,143 @@ def train_meta_learner(archs, num_classes, batch_size,
     else:
         return model, p_train, p_val, p_test                
 
-
 # --- Parameters ---
-num_classes = 10
-epochs = 10
+epochs = 100
 # batch_size = 512
-sub_folder = 'M15'
-archs = ['rnn','cnn']  #, 'lstm', 'gru', 'cnn']
+sub_folder = 'M20'
+archs = ['tsmixer','rnn','cnn']  #, 'lstm', 'gru', 'cnn']
 wl = 10
 dropout = 0.1
 num_heads = 2
-seeds = [11,5,16,13,25,3,15,1,14]
-        #,4,19,6,12,23,20,8,9,18,37,38,82,83,46,33,49,410,1000]#
-        # [6, 28, 42, 95, 138, 196, 276, 496, 8128]
-        #, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144,
-        # 233, 377, 610, 987, 1597, 2584 , 4181, 6765,
-        # 10946, 17711, 28657, 46368, 75025, 121393,
-        # 196418, 317811, 514229]
-# dim = 128
-optimizers = ['adamw','rmsprop','adam','nadam','adamax']
+seeds = [42]  #[6, 28, 42, 138, 276]
+
+optimizers = ['adamw'] #,'adam','rmsprop','nadam','adamax']
 
 dataset = 'Take5' #,'Quick','Mega','Thunderball','Euro','Powerball','C4L','NYLot','HotPicks']
 # for dataset in datasets:
-X_raw = get_real_data(dataset, 120_000)
+real_raw_data = get_real_data(dataset, 120_000)
 
-unique_classes = np.unique(X_raw.flatten())
-class_weights = compute_class_weight('balanced', classes=unique_classes, y=X_raw.flatten())
+data_raw = real_raw_data.reshape(-1,1)
+# data_raw = np.vstack([data_raw, [0]], dtype=np.int8)
+
+target = (data_raw[:,0] == 0).astype(int)
+# X_raw_expanded = np.hstack([data_raw, col[:, np.newaxis]])
+
+unique_classes = np.unique(target.flatten())
+class_weights = compute_class_weight('balanced', classes=unique_classes, y=target.flatten())
 class_weights_dict = dict(enumerate(class_weights))
+num_classes = len(unique_classes)
 
-data_raw = X_raw.reshape(-1,1)
-data_raw = np.vstack([data_raw, [0]], dtype=np.int8)
+div = 10
+splits = len(data_raw)//div
 
-# print(f'\nOriginal data_raw tail: {data_raw[-10:].flatten()}\n')
+dim = 128
+t_dim = 64
 
 fin_res = []
-for _ in range(3):
-    # extra_features = get_extra_features(data_raw, seeds)
-    # data = np.hstack([data_raw, extra_features], dtype=np.int8)
-    data = data_raw
-    
-    # Data Transformations
-    X, data_scaler = transform_selector(data, sub_folder, dataset)    
-    
-    # del X_raw, data_raw, extra_features
-    # data = data_raw
-    # data = np.load('data/Take5_stats_features.npy')
-    
-    batch_size = compute_batch_size(len(data))
-    features = data.shape[-1]
-    input_shape = (wl, features)
-    print(f'\ninput_shape: {input_shape}\n')    
-    
-    dim = 128  #features
+# for _ in range(10):
+data = data_raw.copy()
 
-    X, y = generate_dataset(X, data, wl, features)
-    # X, y = create_windows(data, wl)
+# Data Transformations
+X_full, data_scaler = transform_selector(data, sub_folder, dataset)
+# extra_features = get_extra_features(X_full, [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987,
+#                                              1597, 2584, 4181, 6765, 10946, 17711, 28657, 46368, 75025, 121393,
+#                                              196418, 317811, 514229, 832040, 1346269, 2178309, 3524578, 5702887,
+#                                              9227465, 14930352, 24157817, 39088169, 63245986, 102334155, 165580141,
+#                                              267914296, 433494437, 701408733, 1134903170, 1836311903, 2971215073
+#                                             ])
+# X_full = np.hstack([X_full, extra_features], dtype=np.float32)
+features = X_full.shape[-1]
+input_shape = (wl, features)
 
-    # # Data Transformations
-    # X = transform_selector(X, sub_folder, dataset)
+for s in range(div):
+    X_sub = X_full[-splits*(s+1):-splits*s] if s>0 else X_full[-splits*(s+1):]
+    y_sub = target[-splits*(s+1):-splits*s] if s>0 else target[-splits*(s+1):]
+    
+    batch_size = compute_batch_size(len(X_sub))
+    
+    # print(f'\ninput_shape: {input_shape}\n')    
+    
+    X, y = generate_dataset(X_sub, y_sub, wl, features)
 
     # Reshape X & y to 3D as per model expectation
-    # X = X.reshape(-1, wl, features)
-    # y = y.reshape(-1, 1)
+    X = X.reshape(-1, wl, features)
+    y = y.reshape(-1, 1)
 
     # Data splitting
-    X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.2, shuffle=False)
-    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, shuffle=False)
-    # del X, y, X_temp, y_temp
-    
-    # Scaling data
-    # scaler = MinMaxScaler()
-    # X_train_2d = X_train.reshape(-1, X_train.shape[1]*X_train.shape[2])
-    # X_val_2d = X_val.reshape(-1, X_val.shape[1]*X_val.shape[2])
-    # X_test_2d = X_test.reshape(-1, X_test.shape[1]*X_test.shape[2])
-    
-    # X_train_scaled = scaler.fit_transform(X_train_2d)
-    # X_val_scaled = scaler.transform(X_val_2d)
-    # X_test_scaled = scaler.transform(X_test_2d)
-    
-    # joblib.dump(scaler, f'test_models/{sub_folder}/{dataset}_base_scaler.joblib')
-    
-    # del X_train_2d, X_val_2d, X_test_2d, scaler
-    
-    # Reshape back to 3D format
-    # X_train = X_train_scaled.reshape(-1, X_train.shape[1], X_train.shape[2])
-    # X_val = X_val_scaled.reshape(-1, X_val.shape[1], X_val.shape[2])
-    # X_test = X_test_scaled.reshape(-1, X_test.shape[1], X_test.shape[2])
-    
-    # del X_train_scaled, X_val_scaled, X_test_scaled
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.1, shuffle=False)
     
     train_base_models(dataset, archs, optimizers, dim, seeds, dropout, num_classes, batch_size,
-                                    epochs, sub_folder, X_train, X_val, y_train, y_val)
-    
-    # del X_train, X_val, X_test
-    
-    
-    #############################################################################################
-    #############################################################################################
-    #############################################################################################
-    
-    # for _ in range(10):
-    tot_subs = 1
-    meta1, p_train1, p_val1, p_test1 = None, None, None, None
-    # for i, sub_folder in enumerate(sub_folders):
-    # extra_features = get_extra_features(data_raw, seeds[i])
-    # data = np.hstack([data_raw, extra_features], dtype=np.int8)
-    
-    # batch_size = compute_batch_size(len(data))
-    # features = data.shape[-1]
-    # dim = features*4
-    # input_shape = (wl, features)
-    # print(f'\ninput_shape: {input_shape}\n')
-    
-    # X, y = generate_dataset(data, wl, features)
-    # X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.2, shuffle=False)
-    # X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, shuffle=False)
-    
-    # Scaling data
-    # X_train_2d = X_train.reshape(-1, X_train.shape[1]*X_train.shape[2])
-    # X_val_2d   = X_val.reshape(-1, X_val.shape[1]*X_val.shape[2])
-    # X_test_2d  = X_test.reshape(-1, X_test.shape[1]*X_test.shape[2])
+                                    epochs, sub_folder, X_train, X_val, y_train, y_val, s)
 
-    tot_datasets = 0
-    # for dataset in datasets:
-    # scaler = joblib.load(f'test_models/{sub_folder}/{dataset}_base_scaler.joblib') #MinMaxScaler()
-    # print(f'\nLoaded Scaler: {dataset}_base_scaler in {sub_folder}')
-    
-    # X_train_scaled = scaler.transform(X_train_2d)
-    # X_val_scaled   = scaler.transform(X_val_2d)
-    # X_test_scaled  = scaler.transform(X_test_2d)
-    
-    # # Reshape back to 3D format
-    # X_train_reshaped = X_train_scaled.reshape(-1, X_train.shape[1], X_train.shape[2])
-    # X_val_reshaped   = X_val_scaled.reshape(-1, X_val.shape[1], X_val.shape[2])
-    # X_test_reshaped  = X_test_scaled.reshape(-1, X_test.shape[1], X_test.shape[2])
-    
-    # # del X_train_scaled, X_val_scaled, X_test_scaled
-    
-    # unique_classes     = np.unique(X_raw.flatten())
-    # class_weights      = compute_class_weight('balanced', classes=unique_classes, y=X_raw.flatten())
-    # class_weights_dict = dict(enumerate(class_weights))
-    
-    # The 1st Meta learner trains on base models
-    tf.keras.backend.clear_session()
-    meta1, p_train1, p_val1, p_test1 = train_meta_learner(
-        archs, num_classes, batch_size, epochs, dataset, sub_folder, optimizers, dim,
-        seeds, dropout, X_train, X_val, X_test,
-        y_train, y_val, base='base', l=0, tot_datasets=tot_datasets)
+# print(f'\ninput_shape: {input_shape}\n')     
+X, y = generate_dataset(X_full, data, wl, features)
+batch_size = compute_batch_size(len(X))
+
+# Data splitting
+X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.2, shuffle=False)
+X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, shuffle=False)    
+
+# for _ in range(10):
+tot_subs = 1
+meta1, p_train1, p_val1, p_test1 = None, None, None, None
+tot_datasets = 0
+
+# The 1st Meta learner trains on base models
+tf.keras.backend.clear_session()
+meta1, p_train1, p_val1, p_test1 = train_meta_learner(
+    archs, num_classes, batch_size, epochs, dataset, sub_folder, optimizers, dim,
+    seeds, dropout, X_train, X_val, X_test,
+    y_train, y_val, base='base', l=0, tot_datasets=tot_datasets, t_dim=t_dim)
+
+_ = evaluate_model(meta1, X_test, 'MetaL_1')
+
+# meta1 = load_base_models(sub_folder, 'Meta_L', archs, ['adamw'], 128, [42], l=1)  # Get models using generator
         
-    tot_subs += 1
-    
-    print('\nComparing scores for different Meta Levels')
-    _ = evaluate_model(meta1, p_test1, 'Meta_L1')
+# tot_subs += 1
+# del meta1, p_train1, p_val1, p_test1
 
-    print('\n\n\t\tStarting test inference using preds as updates to data_raw...\n\n')
-    # del (p_train1, p_val1, p_test1, X_train, X_val, X_test, X_train_scaled,
-    #      X_val_scaled, X_test_scaled, X_train_reshaped, X_val_reshaped, X_test_reshaped)
-    # +---------------------------------------------------------+
-    # +--- Test inference using preds as updates to data_raw ---+
-    # +---------------------------------------------------------+
-    
-    '''
-        This section of the code as well as optimizations will 
-        be sorted later once proof of concept confirmed.
-    '''
-        
-    # updated_data_raw = data_raw  #np.vstack([data_raw, new_pred], dtype=np.int8)
-    print(f'\nLast 10 entries of data_raw to be used for inference: {data_raw[-10:].flatten()}')
-    
-    p_train = []
-    # for i, sub_folder in enumerate(sub_folders):
-    # extra_features = get_extra_features(updated_data_raw, seeds[i]) if len(updated_data_raw)>len(data_raw) else extra_features
-    # data = np.hstack([updated_data_raw, extra_features], dtype=np.int8)         
-    
-    # batch_size = compute_batch_size(len(data))
-    # features = data.shape[-1]
-    # dim = features*4
-    # input_shape = (wl, features)
-    # print(f'\ninput_shape: {input_shape}\n')
-    
-    # for dataset in datasets:
-    # scaler = joblib.load(f'test_models/{sub_folder}/{dataset}_base_scaler.joblib') #MinMaxScaler()
-    # print(f'\nLoaded Scaler: {dataset}_base_scaler in {sub_folder}')
+# print('\n\n\t\tStarting test inference using preds as updates to data_raw...\n\n')
 
-    # Reshape data according saved scaler requirements
-    pred_data = data[-10:]  #.reshape(-1, wl*features)
+# # +---------------------------------------------------------+
+# # +--- Test inference using preds as updates to data_raw ---+
+# # +---------------------------------------------------------+
 
-    # Scale data
-    pred_data_scaled = data_scaler.transform(pred_data)
+# '''
+#     This section of the code as well as optimizations will 
+#     be sorted later once proof of concept confirmed.
+# '''
     
-    # Reshape to 3D format as per model expectation
-    pred_data_reshaped = pred_data_scaled.reshape(-1, wl, features)
+# # updated_data_raw = data_raw  #np.vstack([data_raw, new_pred], dtype=np.int8)
+# print(f'\nLast 10 entries of data_raw to be used for inference: {data_raw[-10:].flatten()}')
 
-    tf.keras.backend.clear_session()
-    print(f'\nGetting probabilities from all models in {sub_folder}...')
-    base_models = load_base_models(sub_folder, dataset, archs, optimizers, dim, seeds, l=0)  # Get models using generator
+# p_train = []
 
-    for bm in base_models:
-        print(f'\nGetting probabilities from {bm.name} in {sub_folder}...')
-        bm_pred = bm.predict(pred_data_reshaped, verbose=0)
-        p_train.append(bm_pred)
-        print(f'Recommendation from {bm.name}: {np.argmax(bm_pred, axis=1).flatten()}')
-        del bm_pred
-                
-    p_train = np.stack(p_train, axis=1)  # shape: (batch, num_models, num_classes)
+# # Reshape data according saved scaler requirements
+# pred_data = X_full[-10:]  #.reshape(-1, wl*features)
+
+# # Reshape to 3D format as per model expectation
+# pred_data_reshaped = pred_data.reshape(-1, wl, features)
+
+# tf.keras.backend.clear_session()
+# # tf.keras.config.enable_unsafe_deserialization()
+# print(f'\nGetting probabilities from all models in {sub_folder}...')
+# base_models = load_base_models(sub_folder, dataset, archs, optimizers, dim, seeds, l=0)  # Get models using generator
+
+# for bm in base_models:
+#     print(f'\nGetting probabilities from {bm.name} in {sub_folder}...')
+#     bm_pred = bm.predict(pred_data_reshaped, verbose=0)
+#     p_train.append(bm_pred)
+#     print(f'Recommendation from {bm.name}: {np.argmax(bm_pred, axis=1).flatten()}')
+#     del bm_pred
+            
+# p_train = np.stack(p_train, axis=1)  # shape: (batch, num_models, num_classes)
+
+# tf.keras.backend.clear_session()
+# meta1 = saving.load_model(f'test_models/{sub_folder}/Meta_L1_adamw_dim{t_dim}_seed42.keras')
+# new_pred = np.argmax(meta1.predict(p_train, verbose=0), axis=1)
+# fin_res.extend(new_pred)
     
-    tf.keras.backend.clear_session()
-    new_pred = np.argmax(meta1.predict(p_train, verbose=0), axis=1)
-    fin_res.extend(new_pred)
-        
-    data_raw = np.vstack([data_raw, new_pred], dtype=np.int8)
-    print(f'\nLast 10 entries of updated_data_raw: {data_raw[-10:].flatten()}')
-    print(f'\n\n\t\tResults so far: {fin_res}\n\n')
-    
-    
+# data = np.vstack([data, new_pred], dtype=np.int8)
+# print(f'\nLast 10 entries of updated_data_raw: {data_raw[-10:].flatten()}')
+# print(f'\n\n\t\tResults so far: {fin_res}\n\n')
